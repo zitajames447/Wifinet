@@ -11,6 +11,11 @@
 (define-constant ERR_ALREADY_RATED (err u109))
 (define-constant ERR_QUALITY_TOO_LOW (err u110))
 (define-constant ERR_INSUFFICIENT_SESSIONS (err u111))
+(define-constant ERR_ZONE_NOT_FOUND (err u112))
+(define-constant ERR_ZONE_EXISTS (err u113))
+(define-constant ERR_INVALID_COORDINATES (err u114))
+(define-constant ERR_NOT_ZONE_ADMIN (err u115))
+(define-constant ERR_ZONE_INACTIVE (err u116))
 
 (define-data-var next-node-id uint u1)
 (define-data-var next-proposal-id uint u1)
@@ -18,6 +23,9 @@
 (define-data-var proposal-duration uint u1440)
 (define-data-var min-quality-score uint u50)
 (define-data-var quality-bonus-multiplier uint u20)
+(define-data-var next-zone-id uint u1)
+(define-data-var default-zone-incentive uint u15)
+(define-data-var max-nodes-per-zone uint u50)
 
 (define-map wifi-nodes
     { node-id: uint }
@@ -33,7 +41,8 @@
         total-sessions: uint,
         total-ratings: uint,
         rating-sum: uint,
-        reliability-score: uint
+        reliability-score: uint,
+        zone-id: uint
     }
 )
 
@@ -83,6 +92,39 @@
     { min-score: uint, bonus-percentage: uint, max-visible: bool }
 )
 
+(define-map coverage-zones
+    { zone-id: uint }
+    {
+        name: (string-ascii 50),
+        latitude: uint,
+        longitude: uint,
+        radius: uint,
+        admin: principal,
+        active: bool,
+        node-count: uint,
+        total-bandwidth: uint,
+        avg-quality: uint,
+        coverage-bonus: uint,
+        created-at: uint
+    }
+)
+
+(define-map zone-nodes
+    { zone-id: uint, node-id: uint }
+    { assigned-at: uint, contribution-score: uint }
+)
+
+(define-map zone-coverage-stats
+    { zone-id: uint }
+    {
+        peak-usage: uint,
+        avg-usage: uint,
+        coverage-density: uint,
+        last-updated: uint,
+        incentive-multiplier: uint
+    }
+)
+
 (define-public (join-dao)
     (let
         (
@@ -107,14 +149,18 @@
     )
 )
 
-(define-public (register-wifi-node (location (string-ascii 100)) (bandwidth uint))
+(define-public (register-wifi-node (location (string-ascii 100)) (bandwidth uint) (zone-id uint))
     (let
         (
             (node-id (var-get next-node-id))
             (member-data (map-get? dao-members { member: tx-sender }))
+            (zone-data (map-get? coverage-zones { zone-id: zone-id }))
         )
         (asserts! (is-some member-data) ERR_NOT_MEMBER)
         (asserts! (> bandwidth u0) ERR_INVALID_AMOUNT)
+        (asserts! (if (> zone-id u0) (is-some zone-data) true) ERR_ZONE_NOT_FOUND)
+        (asserts! (if (> zone-id u0) (get active (unwrap-panic zone-data)) true) ERR_ZONE_INACTIVE)
+        
         (map-set wifi-nodes
             { node-id: node-id }
             {
@@ -129,9 +175,23 @@
                 total-sessions: u0,
                 total-ratings: u0,
                 rating-sum: u0,
-                reliability-score: u100
+                reliability-score: u100,
+                zone-id: zone-id
             }
         )
+        
+        (if (> zone-id u0)
+            (begin
+                (map-set zone-nodes
+                    { zone-id: zone-id, node-id: node-id }
+                    { assigned-at: stacks-block-height, contribution-score: u50 }
+                )
+                (try! (update-zone-stats zone-id))
+                true
+            )
+            true
+        )
+        
         (var-set next-node-id (+ node-id u1))
         (ok node-id)
     )
@@ -485,3 +545,247 @@
         false
     )
 )
+
+(define-public (create-coverage-zone (name (string-ascii 50)) (latitude uint) (longitude uint) (radius uint))
+    (let
+        (
+            (zone-id (var-get next-zone-id))
+            (member-data (unwrap! (map-get? dao-members { member: tx-sender }) ERR_NOT_MEMBER))
+        )
+        (asserts! (>= (get voting-power member-data) u1) ERR_UNAUTHORIZED)
+        (asserts! (and (> latitude u0) (> longitude u0) (> radius u0)) ERR_INVALID_COORDINATES)
+        
+        (map-set coverage-zones
+            { zone-id: zone-id }
+            {
+                name: name,
+                latitude: latitude,
+                longitude: longitude,
+                radius: radius,
+                admin: tx-sender,
+                active: true,
+                node-count: u0,
+                total-bandwidth: u0,
+                avg-quality: u0,
+                coverage-bonus: (var-get default-zone-incentive),
+                created-at: stacks-block-height
+            }
+        )
+        
+        (map-set zone-coverage-stats
+            { zone-id: zone-id }
+            {
+                peak-usage: u0,
+                avg-usage: u0,
+                coverage-density: u0,
+                last-updated: stacks-block-height,
+                incentive-multiplier: u100
+            }
+        )
+        
+        (var-set next-zone-id (+ zone-id u1))
+        (ok zone-id)
+    )
+)
+
+(define-public (update-zone-stats (zone-id uint))
+    (let
+        (
+            (zone-data (unwrap! (map-get? coverage-zones { zone-id: zone-id }) ERR_ZONE_NOT_FOUND))
+            (zone-nodes-list (get-zone-node-count zone-id))
+            (total-quality (calculate-zone-quality zone-id))
+            (total-bandwidth (calculate-zone-bandwidth zone-id))
+        )
+        (map-set coverage-zones
+            { zone-id: zone-id }
+            (merge zone-data {
+                node-count: zone-nodes-list,
+                total-bandwidth: total-bandwidth,
+                avg-quality: (if (> zone-nodes-list u0) (/ total-quality zone-nodes-list) u0)
+            })
+        )
+        
+        (let
+            (
+                (coverage-ratio (if (> zone-nodes-list u0) (/ (* zone-nodes-list u100) (var-get max-nodes-per-zone)) u0))
+                (new-multiplier (if (< coverage-ratio u50) u150 (if (< coverage-ratio u80) u120 u100)))
+            )
+            (map-set zone-coverage-stats
+                { zone-id: zone-id }
+                (merge (default-to 
+                    { peak-usage: u0, avg-usage: u0, coverage-density: u0, last-updated: u0, incentive-multiplier: u100 }
+                    (map-get? zone-coverage-stats { zone-id: zone-id })
+                ) {
+                    coverage-density: coverage-ratio,
+                    last-updated: stacks-block-height,
+                    incentive-multiplier: new-multiplier
+                })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (assign-node-to-zone (node-id uint) (zone-id uint))
+    (let
+        (
+            (node-data (unwrap! (map-get? wifi-nodes { node-id: node-id }) ERR_NOT_FOUND))
+            (zone-data (unwrap! (map-get? coverage-zones { zone-id: zone-id }) ERR_ZONE_NOT_FOUND))
+            (current-zone (get zone-id node-data))
+        )
+        (asserts! (is-eq tx-sender (get owner node-data)) ERR_UNAUTHORIZED)
+        (asserts! (get active zone-data) ERR_ZONE_INACTIVE)
+        (asserts! (< (get node-count zone-data) (var-get max-nodes-per-zone)) ERR_INVALID_AMOUNT)
+        
+        (if (> current-zone u0)
+            (map-delete zone-nodes { zone-id: current-zone, node-id: node-id })
+            true
+        )
+        
+        (map-set wifi-nodes
+            { node-id: node-id }
+            (merge node-data { zone-id: zone-id })
+        )
+        
+        (map-set zone-nodes
+            { zone-id: zone-id, node-id: node-id }
+            { assigned-at: stacks-block-height, contribution-score: u50 }
+        )
+        
+        (if (> current-zone u0)
+            (try! (update-zone-stats current-zone))
+            true
+        )
+        (try! (update-zone-stats zone-id))
+        (ok true)
+    )
+)
+
+(define-public (set-zone-incentive (zone-id uint) (bonus-percentage uint))
+    (let
+        (
+            (zone-data (unwrap! (map-get? coverage-zones { zone-id: zone-id }) ERR_ZONE_NOT_FOUND))
+        )
+        (asserts! (or (is-eq tx-sender (get admin zone-data)) (is-eq tx-sender CONTRACT_OWNER)) ERR_NOT_ZONE_ADMIN)
+        (asserts! (<= bonus-percentage u100) ERR_INVALID_AMOUNT)
+        
+        (map-set coverage-zones
+            { zone-id: zone-id }
+            (merge zone-data { coverage-bonus: bonus-percentage })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-zone-status (zone-id uint))
+    (let
+        (
+            (zone-data (unwrap! (map-get? coverage-zones { zone-id: zone-id }) ERR_ZONE_NOT_FOUND))
+        )
+        (asserts! (or (is-eq tx-sender (get admin zone-data)) (is-eq tx-sender CONTRACT_OWNER)) ERR_NOT_ZONE_ADMIN)
+        
+        (map-set coverage-zones
+            { zone-id: zone-id }
+            (merge zone-data { active: (not (get active zone-data)) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (get-zone-pricing-multiplier (zone-id uint))
+    (let
+        (
+            (zone-data (unwrap! (map-get? coverage-zones { zone-id: zone-id }) ERR_ZONE_NOT_FOUND))
+            (stats-data (default-to 
+                { peak-usage: u0, avg-usage: u0, coverage-density: u0, last-updated: u0, incentive-multiplier: u100 }
+                (map-get? zone-coverage-stats { zone-id: zone-id })
+            ))
+        )
+        (let
+            (
+                (base-bonus (get coverage-bonus zone-data))
+                (density-multiplier (get incentive-multiplier stats-data))
+                (final-multiplier (+ u100 base-bonus (if (> density-multiplier u100) (- density-multiplier u100) u0)))
+            )
+            (ok (if (> final-multiplier u200) u200 final-multiplier))
+        )
+    )
+)
+
+(define-private (get-zone-node-count (zone-id uint))
+    (get count (fold count-zone-nodes 
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+        { zone-id: zone-id, count: u0 }
+    ))
+)
+
+(define-private (count-zone-nodes (node-id uint) (accumulator { zone-id: uint, count: uint }))
+    (let
+        (
+            (target-zone (get zone-id accumulator))
+            (node-data (map-get? wifi-nodes { node-id: node-id }))
+        )
+        (if (and (is-some node-data) (is-eq (get zone-id (unwrap-panic node-data)) target-zone))
+            { zone-id: target-zone, count: (+ (get count accumulator) u1) }
+            accumulator
+        )
+    )
+)
+
+(define-private (calculate-zone-quality (zone-id uint))
+    (get total (fold sum-zone-quality 
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+        { zone-id: zone-id, total: u0 }
+    ))
+)
+
+(define-private (sum-zone-quality (node-id uint) (accumulator { zone-id: uint, total: uint }))
+    (let
+        (
+            (target-zone (get zone-id accumulator))
+            (node-data (map-get? wifi-nodes { node-id: node-id }))
+        )
+        (if (and (is-some node-data) (is-eq (get zone-id (unwrap-panic node-data)) target-zone))
+            { zone-id: target-zone, total: (+ (get total accumulator) (get quality-score (unwrap-panic node-data))) }
+            accumulator
+        )
+    )
+)
+
+(define-private (calculate-zone-bandwidth (zone-id uint))
+    (get total (fold sum-zone-bandwidth 
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+        { zone-id: zone-id, total: u0 }
+    ))
+)
+
+(define-private (sum-zone-bandwidth (node-id uint) (accumulator { zone-id: uint, total: uint }))
+    (let
+        (
+            (target-zone (get zone-id accumulator))
+            (node-data (map-get? wifi-nodes { node-id: node-id }))
+        )
+        (if (and (is-some node-data) (is-eq (get zone-id (unwrap-panic node-data)) target-zone) (get active (unwrap-panic node-data)))
+            { zone-id: target-zone, total: (+ (get total accumulator) (get bandwidth (unwrap-panic node-data))) }
+            accumulator
+        )
+    )
+)
+
+(define-read-only (get-zone-info (zone-id uint))
+    (map-get? coverage-zones { zone-id: zone-id })
+)
+
+(define-read-only (get-zone-stats (zone-id uint))
+    (map-get? zone-coverage-stats { zone-id: zone-id })
+)
+
+(define-read-only (get-zone-node-assignment (zone-id uint) (node-id uint))
+    (map-get? zone-nodes { zone-id: zone-id, node-id: node-id })
+)
+
+(define-read-only (get-next-zone-id)
+    (var-get next-zone-id)
+)
+
+
